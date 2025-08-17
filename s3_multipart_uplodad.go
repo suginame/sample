@@ -19,7 +19,10 @@ type CompletedPart struct {
 	ETag string `json:"eTag"`
 }
 
-// CreateMultipartUpload 開始する
+
+
+
+// CreateMultipartUpload マルチパートアップロードを開始し、アップロードIDを返却する
 func (sp *s3Proxy) CreateMultipartUpload(ctx context.Context, bucket, key string) (string, error) {
 	out, err := sp.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket),
@@ -57,8 +60,9 @@ func (sp *s3Proxy) PresignMultipartUploadPart(
 	return res.URL, nil
 }
 
-// CompleteMultipartUpload アップロードを完了する
-func (sp *s3Proxy) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []model.CompletedPart) error {
+// CompleteMultipartUpload マルチパートアップロードを完了する
+func (sp *s3Proxy) CompleteMultipartUpload(
+	ctx context.Context, bucket, key, uploadID string, parts []*model.CompletedPart) error {
 	cps := make([]types.CompletedPart, 0, len(parts))
 	for _, p := range parts {
 		cps = append(cps, types.CompletedPart{
@@ -83,7 +87,7 @@ func (sp *s3Proxy) CompleteMultipartUpload(ctx context.Context, bucket, key, upl
 	return nil
 }
 
-// AbortMultipartUpload アップロードを取り消す
+// AbortMultipartUpload マルチパートアップロードを中止する
 func (sp *s3Proxy) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	_, err := sp.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(bucket),
@@ -101,38 +105,68 @@ func (sp *s3Proxy) AbortMultipartUpload(ctx context.Context, bucket, key, upload
 func (s *S3TestSuite) Test_s3Proxy_MultipartUpload() {
 	ctx := context.Background()
 
-	s.Run("success case", func() {
-		// initiate
+	s.Run("multipartupload complete case", func() {
 		uploadID, err := s.s3.CreateMultipartUpload(ctx, s.testBucket, "multipart/test.bin")
 		s.NoError(err)
 		s.NotEmpty(uploadID)
 
-		// presign part 1
 		url, err := s.s3.PresignMultipartUploadPart(ctx, s.testBucket, "multipart/test.bin", uploadID, 1, time.Minute*15)
 		s.NoError(err)
 		s.NotEmpty(url)
 
-		// abort
+		client := &http.Client{Timeout: time.Second * 10}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, strings.NewReader("part-1-content"))
+		s.NoError(err)
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		resp, err := client.Do(req)
+		s.NoError(err)
+		defer resp.Body.Close()
+		s.Equal(200, resp.StatusCode)
+
+		etag := resp.Header.Get("ETag")
+		s.NotEmpty(etag)
+
+		parts := []*model.CompletedPart{{
+			PartNumber: 1,
+			ETag:       etag,
+		}}
+
+		s.NoError(s.s3.CompleteMultipartUpload(ctx, s.testBucket, "multipart/test.bin", uploadID, parts))
+
+		content, err := s.s3.GetFile(ctx, s.testBucket, "multipart/test.bin")
+		s.NoError(err)
+		s.Exactly("part-1-content", content)
+
+		s.NoError(s.s3.DeleteFile(ctx, s.testBucket, "multipart/test.bin"))
+	})
+
+	s.Run("multipartupload abort case", func() {
+		uploadID, err := s.s3.CreateMultipartUpload(ctx, s.testBucket, "multipart/test.bin")
+		s.NoError(err)
+		s.NotEmpty(uploadID)
+
+		url, err := s.s3.PresignMultipartUploadPart(ctx, s.testBucket, "multipart/test.bin", uploadID, 1, time.Minute*15)
+		s.NoError(err)
+		s.NotEmpty(url)
+
 		s.NoError(s.s3.AbortMultipartUpload(ctx, s.testBucket, "multipart/test.bin", uploadID))
 	})
 
 	s.Run("error case", func() {
-		// invalid initiate
 		id, err := s.s3.CreateMultipartUpload(ctx, "", "")
 		s.Empty(id)
 		s.ErrorContains(err, "failed to create multipart upload")
 
-		// invalid presign
 		url, err := s.s3.PresignMultipartUploadPart(ctx, "", "", "", 0, time.Nanosecond)
 		s.ErrorContains(err, "failed to presign upload part")
 		s.Empty(url)
 
-		// invalid complete
 		err = s.s3.CompleteMultipartUpload(ctx, "", "", "", nil)
 		s.ErrorContains(err, "failed to complete multipart upload")
 
-		// invalid abort
 		err = s.s3.AbortMultipartUpload(ctx, "", "", "")
 		s.ErrorContains(err, "failed to abort multipart upload")
 	})
 }
+
